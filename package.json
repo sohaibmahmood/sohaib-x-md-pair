@@ -1,0 +1,22 @@
+{
+  "name": "sohaib-x-md-pairing",
+  "version": "1.0.0",
+  "description": "ᝰ.ᐟsᴏʜᴀɪʙ-x-ᴍᴅ — WhatsApp Session Pairing Server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.18",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.3.1",
+    "pino": "^8.17.2",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["whatsapp", "bot", "pairing", "session"],
+  "license": "MIT"
+}
