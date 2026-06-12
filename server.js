@@ -1,116 +1,154 @@
 const express = require('express');
-const http = require('http');
-const path = require('path');
-const fs = require('fs');
-const cors = require('cors');
+const https   = require('https');
+const http    = require('http');
+const path    = require('path');
+const fs      = require('fs');
+const cors    = require('cors');
 const rateLimit = require('express-rate-limit');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-const TEMP_DIR = path.join(__dirname, 'temp_sessions');
-const ACTIVE_SESSIONS = new Map(); // Track active pairing sessions
+// ── Constants ────────────────────────────────────────────────────────────────
+const PORT          = process.env.PORT || 3000;
+const TEMP_DIR      = path.join(__dirname, 'temp_sessions');
+const MAX_SESSIONS  = 3;          // Max concurrent WA sockets (RAM protection)
+const SESSION_TTL   = 3 * 60_000; // Auto-kill session after 3 minutes (180s)
 
-// === Middleware ===
+// ── State ─────────────────────────────────────────────────────────────────────
+const ACTIVE_SESSIONS = new Map();
+
+// ── Startup: clean any leftover temp dirs from previous crash ─────────────────
+fs.mkdirSync(TEMP_DIR, { recursive: true });
+try {
+    const leftover = fs.readdirSync(TEMP_DIR);
+    for (const d of leftover) {
+        try { fs.rmSync(path.join(TEMP_DIR, d), { recursive: true, force: true }); } catch (e) {}
+    }
+    if (leftover.length) console.log(`🧹 Cleaned ${leftover.length} orphaned session(s) from previous run.`);
+} catch (e) {}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Rate limit: max 5 pairing attempts per IP per 10 minutes
+// Rate limit: max 5 requests per IP per 10 min
 const pairingLimiter = rateLimit({
-    windowMs: 10 * 60 * 1000, // 10 minutes
+    windowMs: 10 * 60_000,
     max: 5,
-    message: { error: 'Too many pairing attempts. Please wait 10 minutes.' },
+    message: { error: 'Too many attempts. Please wait 10 minutes.' },
     standardHeaders: true,
     legacyHeaders: false
 });
 
-// Ensure temp dir exists
-fs.mkdirSync(TEMP_DIR, { recursive: true });
-
-// === Health check endpoint ===
-app.get('/health', (req, res) => {
+// ── Health / Stats ─────────────────────────────────────────────────────────────
+app.get('/health', (_req, res) => {
+    const mem = process.memoryUsage();
     res.json({
-        status: 'ok',
+        status:         'ok',
         activeSessions: ACTIVE_SESSIONS.size,
-        bot: 'ᝰ.ᐟsᴏʜᴀɪʙ-x-ᴍᴅ ꨄ </👑'
+        maxSessions:    MAX_SESSIONS,
+        memoryMB: {
+            rss:      (mem.rss      / 1024 / 1024).toFixed(1),
+            heapUsed: (mem.heapUsed / 1024 / 1024).toFixed(1),
+            heapTotal:(mem.heapTotal/ 1024 / 1024).toFixed(1),
+        },
+        uptime: Math.floor(process.uptime()) + 's',
+        bot:    'ᝰ.ᐟsᴏʜᴀɪʙ-x-ᴍᴅ ꨄ </👑'
     });
 });
 
-// === SSE Pairing Endpoint ===
+// ── Session cleanup helper ─────────────────────────────────────────────────────
+function destroySession(sessionId, sessionDir, sock) {
+    ACTIVE_SESSIONS.delete(sessionId);
+    // Gracefully terminate the WA socket
+    try { sock?.ws?.close(); } catch (e) {}
+    try { sock?.end(undefined); } catch (e) {}
+    // Delete temp creds from disk after short delay
+    setTimeout(() => {
+        try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {}
+    }, 3000);
+}
+
+// ── SSE Pairing Endpoint ───────────────────────────────────────────────────────
 app.get('/api/pair', pairingLimiter, async (req, res) => {
-    // Set SSE headers
+
+    // ── RAM Guard: reject if too many active sessions ──────────────────────────
+    if (ACTIVE_SESSIONS.size >= MAX_SESSIONS) {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+        res.write(`data: ${JSON.stringify({ type: 'error', message: `Server busy — ${ACTIVE_SESSIONS.size} sessions active. Please try again in 1–2 minutes.` })}\n\n`);
+        return res.end();
+    }
+
+    // ── SSE setup ──────────────────────────────────────────────────────────────
     res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no', // Disable Nginx buffering for SSE
+        'Content-Type':      'text/event-stream',
+        'Cache-Control':     'no-cache',
+        'Connection':        'keep-alive',
+        'X-Accel-Buffering': 'no',
         'Access-Control-Allow-Origin': '*'
     });
 
     const sendSSE = (type, data = {}) => {
-        try {
-            if (!res.writableEnded) {
-                res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
-            }
-        } catch (e) {}
+        try { if (!res.writableEnded) res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`); } catch (e) {}
     };
 
-    // Keep-alive ping every 20s to prevent proxy timeout
-    const keepAliveInterval = setInterval(() => {
-        try {
-            if (!res.writableEnded) res.write(': ping\n\n');
-        } catch (e) { clearInterval(keepAliveInterval); }
-    }, 20000);
+    // Keep-alive comment ping every 20 s (prevents proxy/Railway timeout)
+    const keepAlive = setInterval(() => {
+        try { if (!res.writableEnded) res.write(': ping\n\n'); } catch (e) { clearInterval(keepAlive); }
+    }, 20_000);
 
-    const method = req.query.method; // 'qr' or 'code'
-    const number = (req.query.number || '').replace(/[^0-9]/g, '');
-    const clientIp = req.ip || req.socket.remoteAddress;
+    // ── Input validation ───────────────────────────────────────────────────────
+    const method   = req.query.method || '';
+    const number   = (req.query.number || '').replace(/\D/g, '');
+    const clientIp = req.ip || req.socket?.remoteAddress || 'unknown';
 
-    // Validate inputs
-    if (!method || !['qr', 'code'].includes(method)) {
-        sendSSE('error', { message: 'Invalid pairing method. Use qr or code.' });
-        clearInterval(keepAliveInterval);
+    if (!['qr', 'code'].includes(method)) {
+        sendSSE('error', { message: 'Invalid method. Use qr or code.' });
+        clearInterval(keepAlive);
+        return res.end();
+    }
+    if (method === 'code' && (!number || number.length < 7 || number.length > 15)) {
+        sendSSE('error', { message: 'Valid phone number with country code required (e.g. 923148740994).' });
+        clearInterval(keepAlive);
         return res.end();
     }
 
-    if (method === 'code' && !number) {
-        sendSSE('error', { message: 'Phone number is required for pairing code method.' });
-        clearInterval(keepAliveInterval);
-        return res.end();
-    }
-
-    if (method === 'code' && (number.length < 7 || number.length > 15)) {
-        sendSSE('error', { message: 'Invalid phone number. Include country code (e.g. 923148740994).' });
-        clearInterval(keepAliveInterval);
-        return res.end();
-    }
-
-    // Create unique session directory for this user
-    const sessionId = `session-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    // ── Session dir ────────────────────────────────────────────────────────────
+    const sessionId  = `sess-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const sessionDir = path.join(TEMP_DIR, sessionId);
     fs.mkdirSync(sessionDir, { recursive: true });
 
     let isClosed = false;
-    let sock = null;
+    let sock     = null;
     let pairingCodeRequested = false;
 
-    const cleanup = () => {
+    // ── Master cleanup ─────────────────────────────────────────────────────────
+    const cleanup = (reason = '') => {
+        if (isClosed) return;
         isClosed = true;
-        clearInterval(keepAliveInterval);
-        ACTIVE_SESSIONS.delete(sessionId);
-        try { sock?.end(undefined); } catch (e) {}
-        // Delay cleanup to allow final reads
-        setTimeout(() => {
-            try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {}
-        }, 5000);
+        clearInterval(keepAlive);
+        if (ttlTimer) clearTimeout(ttlTimer);
+        destroySession(sessionId, sessionDir, sock);
+        if (reason) console.log(`[${sessionId}] Cleaned up: ${reason}. Active: ${ACTIVE_SESSIONS.size}`);
     };
 
-    // Cleanup when client disconnects
-    res.on('close', () => {
-        if (!isClosed) cleanup();
-    });
+    // ── Hard TTL: auto-kill after SESSION_TTL ms to prevent RAM leak ───────────
+    const ttlTimer = setTimeout(() => {
+        if (!isClosed) {
+            sendSSE('error', { message: 'Session timed out (3 min). Please try again.' });
+            cleanup('TTL expired');
+            if (!res.writableEnded) res.end();
+        }
+    }, SESSION_TTL);
+
+    // ── Cleanup on client disconnect ───────────────────────────────────────────
+    res.on('close', () => cleanup('client disconnected'));
+
+    // ── Register session ───────────────────────────────────────────────────────
+    ACTIVE_SESSIONS.set(sessionId, { method, ip: clientIp, startedAt: Date.now() });
+    console.log(`[${sessionId}] New ${method.toUpperCase()} session. Active: ${ACTIVE_SESSIONS.size}/${MAX_SESSIONS} | RAM: ${(process.memoryUsage().rss/1024/1024).toFixed(0)}MB`);
 
     sendSSE('status', { message: 'Initializing WhatsApp connection...', icon: '🔌' });
 
@@ -120,115 +158,89 @@ app.get('/api/pair', pairingLimiter, async (req, res) => {
 
         sock = makeWASocket({
             version,
-            auth: state,
-            logger: pino({ level: 'silent' }),
-            printQRInTerminal: false,
-            browser: ['Ubuntu', 'Chrome', '20.0.04'],
-            connectTimeoutMs: 60_000,
-            defaultQueryTimeoutMs: 30_000,
-            keepAliveIntervalMs: 25_000,
-            retryRequestDelayMs: 250
+            auth:                 state,
+            logger:               pino({ level: 'silent' }),
+            printQRInTerminal:    false,
+            browser:              ['Ubuntu', 'Chrome', '20.0.04'],
+            connectTimeoutMs:     60_000,
+            defaultQueryTimeoutMs:30_000,
+            keepAliveIntervalMs:  25_000,
+            retryRequestDelayMs:  250,
+            // Memory savings: skip unnecessary caches
+            generateHighQualityLinkPreview: false,
+            syncFullHistory: false,
         });
-
-        ACTIVE_SESSIONS.set(sessionId, { sock, method, ip: clientIp, startedAt: new Date() });
 
         sock.ev.on('creds.update', saveCreds);
 
-        // Request pairing code after socket is ready
         sock.ev.on('connection.update', async (update) => {
             if (isClosed) return;
             const { connection, lastDisconnect, qr } = update;
 
-            // Handle QR code delivery
             if (qr && method === 'qr') {
                 sendSSE('qr', { qr });
                 sendSSE('status', { message: 'QR Code ready — scan now!', icon: '📱' });
             }
 
-            // Request pairing code once connected to WA servers (before auth)
-            if (connection === 'connecting' && method === 'code' && !pairingCodeRequested && !sock.authState.creds.registered) {
-                // Wait briefly for socket to be ready
-            }
-
             if (connection === 'open') {
-                // ✅ Successfully authenticated!
                 sendSSE('status', { message: 'Connected! Generating your Session ID...', icon: '⚡' });
-
                 try {
                     const credsPath = path.join(sessionDir, 'creds.json');
-                    
-                    // Wait for creds file to be written
                     let attempts = 0;
-                    while (!fs.existsSync(credsPath) && attempts < 10) {
+                    while (!fs.existsSync(credsPath) && attempts++ < 10) {
                         await new Promise(r => setTimeout(r, 500));
-                        attempts++;
                     }
-
-                    if (!fs.existsSync(credsPath)) {
-                        throw new Error('Credentials file not found after authentication');
-                    }
+                    if (!fs.existsSync(credsPath)) throw new Error('creds.json not written in time');
 
                     const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
-                    const generatedSessionId = 'STARK-MD~' + Buffer.from(JSON.stringify(creds)).toString('base64');
+                    const generatedId = 'STARK-MD~' + Buffer.from(JSON.stringify(creds)).toString('base64');
 
-                    // Send session ID to the user's own WhatsApp
+                    // Send to user's own WhatsApp
                     try {
                         const userJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
-                        const message = `╔═══════════════════════╗\n║  ᝰ.ᐟsᴏʜᴀɪʙ-x-ᴍᴅ ꨄ </👑  ║\n╚═══════════════════════╝\n\n✅ *SESSION ID GENERATED*\n\nCopy the text below and paste it as your SESSION_ID:\n\n${generatedSessionId}\n\n⚠️ *Keep this private! Anyone with this ID can control your WhatsApp.*`;
-                        await sock.sendMessage(userJid, { text: message });
+                        await sock.sendMessage(userJid, {
+                            text: `╔══════════════════════╗\n║ ᝰ.ᐟsᴏʜᴀɪʙ-x-ᴍᴅ ꨄ </👑 ║\n╚══════════════════════╝\n\n✅ *SESSION ID GENERATED*\n\nPaste this as your SESSION_ID:\n\n${generatedId}\n\n⚠️ Keep this PRIVATE!`
+                        });
                         sendSSE('status', { message: 'Session ID sent to your WhatsApp!', icon: '📨' });
                     } catch (sendErr) {
-                        // Non-fatal — still return session ID on screen
-                        console.warn('Could not send session to WhatsApp:', sendErr.message);
+                        console.warn(`[${sessionId}] WA send failed (non-fatal):`, sendErr.message);
                     }
 
-                    sendSSE('connected', {
-                        sessionId: generatedSessionId,
-                        message: 'Session generated successfully!'
-                    });
+                    sendSSE('connected', { sessionId: generatedId, message: 'Session generated!' });
                 } catch (e) {
                     sendSSE('error', { message: 'Failed to generate session: ' + e.message });
                 }
-
-                cleanup();
+                cleanup('pairing complete');
                 if (!res.writableEnded) res.end();
             }
 
-            if (connection === 'close') {
-                const statusCode = lastDisconnect?.error?.output?.statusCode;
-                const reason = DisconnectReason[statusCode] || statusCode || 'Unknown';
-
-                if (!isClosed) {
-                    if (statusCode === 401 || statusCode === 403) {
-                        sendSSE('error', { message: 'Session rejected by WhatsApp. Please try again.' });
-                    } else if (statusCode === 408) {
-                        sendSSE('error', { message: 'Connection timed out. Please try again.' });
-                    } else {
-                        sendSSE('error', { message: `Disconnected (${reason}). Please try again.` });
-                    }
-                    cleanup();
-                    if (!res.writableEnded) res.end();
-                }
+            if (connection === 'close' && !isClosed) {
+                const code   = lastDisconnect?.error?.output?.statusCode;
+                const reason = DisconnectReason[code] || code || 'Unknown';
+                const msg    = code === 401 || code === 403
+                    ? 'Rejected by WhatsApp. Please try again.'
+                    : `Disconnected (${reason}). Please try again.`;
+                sendSSE('error', { message: msg });
+                cleanup(`WA close code=${code}`);
+                if (!res.writableEnded) res.end();
             }
         });
 
-        // For pairing code method — request code after small delay
+        // Pairing code: request after 3 s delay
         if (method === 'code') {
             sendSSE('status', { message: 'Requesting pairing code...', icon: '🔢' });
             await new Promise(r => setTimeout(r, 3000));
-
             if (!isClosed && !pairingCodeRequested) {
                 pairingCodeRequested = true;
                 try {
-                    const code = await sock.requestPairingCode(number);
-                    // Format code as XXXX-XXXX
+                    const code      = await sock.requestPairingCode(number);
                     const formatted = code.match(/.{1,4}/g)?.join('-') || code;
                     sendSSE('code', { code: formatted });
-                    sendSSE('status', { message: 'Enter this code in WhatsApp > Linked Devices', icon: '📲' });
+                    sendSSE('status', { message: 'Enter this code in WhatsApp › Linked Devices', icon: '📲' });
                 } catch (err) {
                     if (!isClosed) {
-                        sendSSE('error', { message: 'Failed to request pairing code: ' + err.message + '. Try QR method instead.' });
-                        cleanup();
+                        sendSSE('error', { message: 'Pairing code failed: ' + err.message + '. Try QR instead.' });
+                        cleanup('pairing code error');
                         if (!res.writableEnded) res.end();
                     }
                 }
@@ -236,66 +248,48 @@ app.get('/api/pair', pairingLimiter, async (req, res) => {
         }
 
     } catch (e) {
-        console.error('Pairing server error:', e);
-        if (!isClosed) {
-            sendSSE('error', { message: 'Server error: ' + e.message });
-            clearInterval(keepAliveInterval);
-        }
-        cleanup();
+        console.error(`[${sessionId}] Fatal error:`, e.message);
+        if (!isClosed) sendSSE('error', { message: 'Server error: ' + e.message });
+        cleanup('fatal error');
         if (!res.writableEnded) res.end();
     }
 });
 
-// === Stats endpoint (admin info) ===
-app.get('/api/stats', (req, res) => {
-    res.json({
-        activePairingSessions: ACTIVE_SESSIONS.size,
-        uptime: process.uptime(),
-        memory: process.memoryUsage(),
-        nodeVersion: process.version
-    });
-});
+// ── 404 → index ────────────────────────────────────────────────────────────────
+app.use((_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
-// === 404 fallback to index.html ===
-app.use((req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-// Start server
+// ── Start ──────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`\n🚀 ᝰ.ᐟsᴏʜᴀɪʙ-x-ᴍᴅ Pairing Server`);
-    console.log(`📡 Running at http://0.0.0.0:${PORT}`);
-    console.log(`🔒 Rate limiting: 5 sessions per IP per 10 minutes`);
-    console.log(`✅ Ready to generate sessions!\n`);
+    console.log(`📡 http://0.0.0.0:${PORT}`);
+    console.log(`🛡️  Max concurrent sessions: ${MAX_SESSIONS} (RAM guard)`);
+    console.log(`⏱️  Session TTL: ${SESSION_TTL / 1000}s (auto-kill)`);
+    console.log(`✅ Ready!\n`);
 
-    // ── Self-Ping Keep-Alive (prevents Render/free hosts from sleeping) ──
-    // Auto-detects Render's public URL via RENDER_EXTERNAL_URL env var.
-    // Pings /health every 14 minutes so the server never goes cold.
-    const selfPingUrl = process.env.RENDER_EXTERNAL_URL || process.env.SELF_PING_URL;
-    if (selfPingUrl) {
-        const pingTarget = selfPingUrl.replace(/\/$/, '') + '/health';
-        console.log(`🏓 Self-ping keep-alive enabled → ${pingTarget}`);
+    // ── Memory monitor: log RAM every 5 min ────────────────────────────────────
+    setInterval(() => {
+        const m = process.memoryUsage();
+        console.log(`📊 RAM: ${(m.rss/1024/1024).toFixed(0)}MB RSS | ${(m.heapUsed/1024/1024).toFixed(0)}MB heap | Sessions: ${ACTIVE_SESSIONS.size}/${MAX_SESSIONS}`);
+    }, 5 * 60_000);
+
+    // ── Self-ping keep-alive (Railway / Render) ────────────────────────────────
+    const pingBase = process.env.RAILWAY_PUBLIC_DOMAIN
+        ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+        : (process.env.RENDER_EXTERNAL_URL || process.env.SELF_PING_URL);
+
+    if (pingBase) {
+        const target = pingBase.replace(/\/$/, '') + '/health';
+        console.log(`🏓 Self-ping → ${target}`);
         setInterval(() => {
             try {
-                const urlObj = new URL(pingTarget);
-                const mod = urlObj.protocol === 'https:' ? require('https') : http;
-                const req = mod.get(pingTarget, (res) => {
-                    // Silent success — just keeping the server warm
-                }).on('error', () => {
-                    // Silently ignore ping errors
-                });
-                req.setTimeout(10000, () => req.destroy());
+                const mod = target.startsWith('https') ? https : http;
+                const r   = mod.get(target, () => {}).on('error', () => {});
+                r.setTimeout(8000, () => r.destroy());
             } catch (e) {}
-        }, 14 * 60 * 1000); // Every 14 minutes
-    } else {
-        console.log(`ℹ️  Set RENDER_EXTERNAL_URL or SELF_PING_URL env var to enable keep-alive ping.`);
+        }, 14 * 60_000);
     }
 });
 
-// Handle uncaught errors gracefully
-process.on('uncaughtException', (err) => {
-    console.error('Uncaught Exception:', err.message);
-});
-process.on('unhandledRejection', (reason) => {
-    console.error('Unhandled Rejection:', reason);
-});
+// ── Global error guards ────────────────────────────────────────────────────────
+process.on('uncaughtException',  (e) => console.error('⚠️ Uncaught:', e.message));
+process.on('unhandledRejection', (e) => console.error('⚠️ Rejection:', e));
