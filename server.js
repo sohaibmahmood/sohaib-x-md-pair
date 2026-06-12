@@ -1,4 +1,5 @@
 const express = require('express');
+const http = require('http');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
@@ -266,6 +267,29 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`📡 Running at http://0.0.0.0:${PORT}`);
     console.log(`🔒 Rate limiting: 5 sessions per IP per 10 minutes`);
     console.log(`✅ Ready to generate sessions!\n`);
+
+    // ── Self-Ping Keep-Alive (prevents Render/free hosts from sleeping) ──
+    // Auto-detects Render's public URL via RENDER_EXTERNAL_URL env var.
+    // Pings /health every 14 minutes so the server never goes cold.
+    const selfPingUrl = process.env.RENDER_EXTERNAL_URL || process.env.SELF_PING_URL;
+    if (selfPingUrl) {
+        const pingTarget = selfPingUrl.replace(/\/$/, '') + '/health';
+        console.log(`🏓 Self-ping keep-alive enabled → ${pingTarget}`);
+        setInterval(() => {
+            try {
+                const urlObj = new URL(pingTarget);
+                const mod = urlObj.protocol === 'https:' ? require('https') : http;
+                const req = mod.get(pingTarget, (res) => {
+                    // Silent success — just keeping the server warm
+                }).on('error', () => {
+                    // Silently ignore ping errors
+                });
+                req.setTimeout(10000, () => req.destroy());
+            } catch (e) {}
+        }, 14 * 60 * 1000); // Every 14 minutes
+    } else {
+        console.log(`ℹ️  Set RENDER_EXTERNAL_URL or SELF_PING_URL env var to enable keep-alive ping.`);
+    }
 });
 
 // Handle uncaught errors gracefully
