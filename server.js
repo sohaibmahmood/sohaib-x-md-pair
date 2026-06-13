@@ -70,15 +70,25 @@ function spawnBot(sessionId) {
     }
 
     console.log(`[Manager] Spawning single bot instance for session: ${sessionId.slice(0, 15)}...`);
-    const child = fork(path.join(__dirname, '..', 'index.js'), [], {
+    const child = fork(path.join(__dirname, 'index.js'), [], {
         env: {
             ...process.env,
             SESSION_ID: sessionId
         },
-        stdio: 'inherit'
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc']
     });
 
     ACTIVE_BOTS.set('bot', child);
+
+    child.stdout.on('data', (data) => {
+        const lines = data.toString().trim().split('\n');
+        lines.forEach(line => { if (line) console.log(`[Bot] ${line}`); });
+    });
+
+    child.stderr.on('data', (data) => {
+        const lines = data.toString().trim().split('\n');
+        lines.forEach(line => { if (line) console.error(`[Bot-Error] ${line}`); });
+    });
 
     child.on('exit', (code, signal) => {
         console.log(`[Manager] Bot process exited. Code: ${code}, Signal: ${signal}`);
@@ -319,16 +329,23 @@ app.get('/api/pair', pairingLimiter, async (req, res) => {
                 }
 
                 if (connection === 'open') {
-                    sendSSE('status', { message: 'Connected! Generating your Session ID...', icon: '⚡' });
+                    sendSSE('status', { message: 'Connected! Finalizing credentials...', icon: '⚡' });
                     try {
+                        // Wait 3.5 seconds to let Baileys finalize credentials and write them to disk
+                        await new Promise(r => setTimeout(r, 3500));
+
                         const credsPath = path.join(sessionDir, 'creds.json');
-                        let attempts = 0;
-                        while (!fs.existsSync(credsPath) && attempts++ < 10) {
-                            await new Promise(r => setTimeout(r, 500));
-                        }
                         if (!fs.existsSync(credsPath)) throw new Error('creds.json not written in time');
 
-                        const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+                        let creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+                        
+                        // If not marked registered yet, try one more time
+                        if (!creds.registered) {
+                            console.log(`[${sessionId}] creds.registered is false, waiting for final write...`);
+                            await new Promise(r => setTimeout(r, 2000));
+                            creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+                        }
+
                         const generatedId = 'STARK-MD~' + Buffer.from(JSON.stringify(creds)).toString('base64');
 
                         // Send to user's own WhatsApp
@@ -341,6 +358,9 @@ app.get('/api/pair', pairingLimiter, async (req, res) => {
                         } catch (sendErr) {
                             console.warn(`[${sessionId}] WA send failed (non-fatal):`, sendErr.message);
                         }
+
+                        // Wait 3 seconds to ensure the WebSocket fully flushes the message out
+                        await new Promise(r => setTimeout(r, 3000));
 
                         sendSSE('connected', { sessionId: generatedId, message: 'Session generated!' });
 
