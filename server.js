@@ -36,31 +36,40 @@ const SESSION_TTL   = 3 * 60_000; // Auto-kill session after 3 minutes (180s)
 // ── State ─────────────────────────────────────────────────────────────────────
 const ACTIVE_SESSIONS = new Map();
 
-// ── Multi-Client Manager State & Helpers ─────────────────────────────────────
+// ── Single-Bot Manager State & Helpers ─────────────────────────────────────
 const SESSIONS_FILE = path.join(__dirname, 'sessions.json');
-const ACTIVE_BOTS = new Map();
+const ACTIVE_BOTS = new Map(); // tracks single bot instance: 'bot' -> ChildProcess
 
-function readSessions() {
+function readSession() {
     try {
         if (!fs.existsSync(SESSIONS_FILE)) {
-            fs.writeFileSync(SESSIONS_FILE, JSON.stringify([]));
+            fs.writeFileSync(SESSIONS_FILE, JSON.stringify({ sessionId: '' }));
         }
-        return JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
+        const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
+        return data.sessionId || '';
     } catch (e) {
-        return [];
+        return '';
     }
 }
 
-function saveSessions(sessions) {
+function saveSession(sessionId) {
     try {
-        fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2));
+        fs.writeFileSync(SESSIONS_FILE, JSON.stringify({ sessionId }, null, 2));
     } catch (e) {}
 }
 
 function spawnBot(sessionId) {
-    if (ACTIVE_BOTS.has(sessionId)) return;
+    if (!sessionId) return;
 
-    console.log(`[Manager] Spawning bot for session ${sessionId.slice(0, 15)}...`);
+    // Terminate existing active bot before starting the new one
+    const existing = ACTIVE_BOTS.get('bot');
+    if (existing) {
+        console.log('[Manager] Terminating current bot to run the new session...');
+        existing.kill();
+        ACTIVE_BOTS.delete('bot');
+    }
+
+    console.log(`[Manager] Spawning single bot instance for session: ${sessionId.slice(0, 15)}...`);
     const child = fork(path.join(__dirname, '..', 'index.js'), [], {
         env: {
             ...process.env,
@@ -69,17 +78,17 @@ function spawnBot(sessionId) {
         stdio: 'inherit'
     });
 
-    ACTIVE_BOTS.set(sessionId, child);
+    ACTIVE_BOTS.set('bot', child);
 
     child.on('exit', (code, signal) => {
         console.log(`[Manager] Bot process exited. Code: ${code}, Signal: ${signal}`);
-        ACTIVE_BOTS.delete(sessionId);
+        ACTIVE_BOTS.delete('bot');
         
         // Auto-restart if not clean exit
         if (code !== 0) {
             setTimeout(() => {
-                const sessions = readSessions();
-                if (sessions.includes(sessionId)) {
+                const current = readSession();
+                if (current === sessionId) {
                     spawnBot(sessionId);
                 }
             }, 5000);
@@ -335,17 +344,13 @@ app.get('/api/pair', pairingLimiter, async (req, res) => {
 
                         sendSSE('connected', { sessionId: generatedId, message: 'Session generated!' });
 
-                        // Automatically register and spawn bot!
+                        // Automatically save and spawn the single bot!
                         try {
-                            const sessions = readSessions();
-                            if (!sessions.includes(generatedId)) {
-                                sessions.push(generatedId);
-                                saveSessions(sessions);
-                                spawnBot(generatedId);
-                                console.log(`[Manager] Successfully registered and spawned bot for new session.`);
-                            }
+                            saveSession(generatedId);
+                            spawnBot(generatedId);
+                            console.log(`[Manager] Successfully saved session and spawned single bot instance.`);
                         } catch (managerErr) {
-                            console.error(`[Manager] Failed to register paired bot:`, managerErr.message);
+                            console.error(`[Manager] Failed to save and spawn single bot:`, managerErr.message);
                         }
                     } catch (e) {
                         sendSSE('error', { message: 'Failed to generate session: ' + e.message });
@@ -402,37 +407,31 @@ app.get('/api/pair', pairingLimiter, async (req, res) => {
 });
 
 app.post('/api/delete-session', (req, res) => {
-    const { sessionId } = req.body;
-    if (!sessionId) return res.status(400).json({ error: 'Session ID required' });
-
     try {
-        const sessions = readSessions();
-        const index = sessions.indexOf(sessionId);
-        if (index !== -1) {
-            sessions.splice(index, 1);
-            saveSessions(sessions);
-        }
-
-        const child = ACTIVE_BOTS.get(sessionId);
+        saveSession('');
+        const child = ACTIVE_BOTS.get('bot');
         if (child) {
             child.kill();
-            ACTIVE_BOTS.delete(sessionId);
-            console.log(`[Manager] Stopped bot instance for deleted session: ${sessionId.slice(0, 15)}...`);
+            ACTIVE_BOTS.delete('bot');
+            console.log(`[Manager] Stopped single bot instance.`);
         }
-
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
 });
 
-// Start all saved bots at server startup
+// Start the saved single bot at server startup
 try {
-    const saved = readSessions();
-    console.log(`\n[Manager] Loading ${saved.length} saved session(s)...`);
-    saved.forEach(spawnBot);
+    const saved = readSession();
+    if (saved) {
+        console.log(`\n[Manager] Loading your saved bot session...`);
+        spawnBot(saved);
+    } else {
+        console.log(`\n[Manager] No saved bot session found.`);
+    }
 } catch (e) {
-    console.error('[Manager] Failed to load saved bots at boot:', e.message);
+    console.error('[Manager] Failed to load saved bot at boot:', e.message);
 }
 
 // ── 404 → index ────────────────────────────────────────────────────────────────
