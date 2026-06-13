@@ -363,7 +363,33 @@ function copyFromSaved(i) {
     });
 }
 function deleteSession(i) {
-    const sessions = getSessions(); sessions.splice(i, 1); saveSessions(sessions); renderSessions();
+    const sessions = getSessions();
+    const s = sessions[i];
+    if (!s) return;
+    if (confirm(`Stop the bot and delete session "${s.id}"?`)) {
+        setStatus('Stopping bot...');
+        fetch('/api/delete-session', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId: s.sessionId })
+        })
+        .then(res => res.json())
+        .then(data => {
+            if (data.success) {
+                sessions.splice(i, 1);
+                saveSessions(sessions);
+                renderSessions();
+                setStatus('🗑️ Bot stopped and session deleted successfully.');
+            } else {
+                alert('Error stopping bot: ' + (data.error || 'Unknown error'));
+                setStatus('Ready');
+            }
+        })
+        .catch(err => {
+            alert('Network error stopping bot: ' + err.message);
+            setStatus('Ready');
+        });
+    }
 }
 function clearAllSessions() {
     if (confirm('Delete all saved sessions?')) { saveSessions([]); renderSessions(); }

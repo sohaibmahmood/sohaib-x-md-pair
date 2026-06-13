@@ -4,6 +4,7 @@ const http    = require('http');
 const path    = require('path');
 const fs      = require('fs');
 const cors    = require('cors');
+const { fork } = require('child_process');
 const rateLimit = require('express-rate-limit');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
@@ -34,6 +35,57 @@ const SESSION_TTL   = 3 * 60_000; // Auto-kill session after 3 minutes (180s)
 
 // ── State ─────────────────────────────────────────────────────────────────────
 const ACTIVE_SESSIONS = new Map();
+
+// ── Multi-Client Manager State & Helpers ─────────────────────────────────────
+const SESSIONS_FILE = path.join(__dirname, 'sessions.json');
+const ACTIVE_BOTS = new Map();
+
+function readSessions() {
+    try {
+        if (!fs.existsSync(SESSIONS_FILE)) {
+            fs.writeFileSync(SESSIONS_FILE, JSON.stringify([]));
+        }
+        return JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
+    } catch (e) {
+        return [];
+    }
+}
+
+function saveSessions(sessions) {
+    try {
+        fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2));
+    } catch (e) {}
+}
+
+function spawnBot(sessionId) {
+    if (ACTIVE_BOTS.has(sessionId)) return;
+
+    console.log(`[Manager] Spawning bot for session ${sessionId.slice(0, 15)}...`);
+    const child = fork(path.join(__dirname, '..', 'index.js'), [], {
+        env: {
+            ...process.env,
+            SESSION_ID: sessionId
+        },
+        stdio: 'inherit'
+    });
+
+    ACTIVE_BOTS.set(sessionId, child);
+
+    child.on('exit', (code, signal) => {
+        console.log(`[Manager] Bot process exited. Code: ${code}, Signal: ${signal}`);
+        ACTIVE_BOTS.delete(sessionId);
+        
+        // Auto-restart if not clean exit
+        if (code !== 0) {
+            setTimeout(() => {
+                const sessions = readSessions();
+                if (sessions.includes(sessionId)) {
+                    spawnBot(sessionId);
+                }
+            }, 5000);
+        }
+    });
+}
 
 // ── WA Version Cache (FLASH OPTIMIZATION) ─────────────────────────────────────
 // Pre-fetch once at startup so each user's session starts INSTANTLY
@@ -282,6 +334,19 @@ app.get('/api/pair', pairingLimiter, async (req, res) => {
                         }
 
                         sendSSE('connected', { sessionId: generatedId, message: 'Session generated!' });
+
+                        // Automatically register and spawn bot!
+                        try {
+                            const sessions = readSessions();
+                            if (!sessions.includes(generatedId)) {
+                                sessions.push(generatedId);
+                                saveSessions(sessions);
+                                spawnBot(generatedId);
+                                console.log(`[Manager] Successfully registered and spawned bot for new session.`);
+                            }
+                        } catch (managerErr) {
+                            console.error(`[Manager] Failed to register paired bot:`, managerErr.message);
+                        }
                     } catch (e) {
                         sendSSE('error', { message: 'Failed to generate session: ' + e.message });
                     }
@@ -335,6 +400,40 @@ app.get('/api/pair', pairingLimiter, async (req, res) => {
 
     connect();
 });
+
+app.post('/api/delete-session', (req, res) => {
+    const { sessionId } = req.body;
+    if (!sessionId) return res.status(400).json({ error: 'Session ID required' });
+
+    try {
+        const sessions = readSessions();
+        const index = sessions.indexOf(sessionId);
+        if (index !== -1) {
+            sessions.splice(index, 1);
+            saveSessions(sessions);
+        }
+
+        const child = ACTIVE_BOTS.get(sessionId);
+        if (child) {
+            child.kill();
+            ACTIVE_BOTS.delete(sessionId);
+            console.log(`[Manager] Stopped bot instance for deleted session: ${sessionId.slice(0, 15)}...`);
+        }
+
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Start all saved bots at server startup
+try {
+    const saved = readSessions();
+    console.log(`\n[Manager] Loading ${saved.length} saved session(s)...`);
+    saved.forEach(spawnBot);
+} catch (e) {
+    console.error('[Manager] Failed to load saved bots at boot:', e.message);
+}
 
 // ── 404 → index ────────────────────────────────────────────────────────────────
 app.use((_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
