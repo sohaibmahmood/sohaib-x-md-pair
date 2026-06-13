@@ -17,6 +17,27 @@ const SESSION_TTL   = 3 * 60_000; // Auto-kill session after 3 minutes (180s)
 // ── State ─────────────────────────────────────────────────────────────────────
 const ACTIVE_SESSIONS = new Map();
 
+// ── WA Version Cache (FLASH OPTIMIZATION) ─────────────────────────────────────
+// Pre-fetch once at startup so each user's session starts INSTANTLY
+// instead of making a slow GitHub API call (~1-2s) per pairing request.
+let cachedWAVersion = null;
+fetchLatestBaileysVersion()
+    .then(({ version }) => {
+        cachedWAVersion = version;
+        console.log(`⚡ WA version cached: [${version}] — all sessions will start instantly!`);
+    })
+    .catch(() => {
+        cachedWAVersion = [2, 3000, 1035194821]; // Known-good fallback version
+        console.warn('⚠️ Could not fetch WA version — using fallback.');
+    });
+
+// Refresh version every 6 hours to stay current
+setInterval(() => {
+    fetchLatestBaileysVersion()
+        .then(({ version }) => { cachedWAVersion = version; })
+        .catch(() => {});
+}, 6 * 60 * 60_000);
+
 // ── Startup: clean any leftover temp dirs from previous crash ─────────────────
 fs.mkdirSync(TEMP_DIR, { recursive: true });
 try {
@@ -153,7 +174,8 @@ app.get('/api/pair', pairingLimiter, async (req, res) => {
     sendSSE('status', { message: 'Initializing WhatsApp connection...', icon: '🔌' });
 
     try {
-        const { version } = await fetchLatestBaileysVersion();
+        // Use pre-cached version for FLASH-FAST startup (no GitHub API call per user)
+        const version = cachedWAVersion || (await fetchLatestBaileysVersion()).version;
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
 
         sock = makeWASocket({
