@@ -8,6 +8,24 @@ const rateLimit = require('express-rate-limit');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
+// ── Console Redirect Logger ──────────────────────────────────────────────────
+const LOG_FILE = path.join(__dirname, 'server.log');
+try { fs.unlinkSync(LOG_FILE); } catch (e) {}
+
+const writeLog = (type, args) => {
+    const time = new Date().toISOString();
+    const msg = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : String(arg)).join(' ');
+    try { fs.appendFileSync(LOG_FILE, `[${time}] [${type}] ${msg}\n`); } catch (e) {}
+};
+
+const originalLog = console.log;
+const originalError = console.error;
+const originalWarn = console.warn;
+
+console.log = (...args) => { originalLog(...args); writeLog('INFO', args); };
+console.error = (...args) => { originalError(...args); writeLog('ERROR', args); };
+console.warn = (...args) => { originalWarn(...args); writeLog('WARN', args); };
+
 // ── Constants ────────────────────────────────────────────────────────────────
 const PORT          = process.env.PORT || 3000;
 const TEMP_DIR      = path.join(__dirname, 'temp_sessions');
@@ -53,6 +71,15 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
+app.get('/logs', (req, res) => {
+    res.setHeader('Content-Type', 'text/plain');
+    if (fs.existsSync(LOG_FILE)) {
+        res.send(fs.readFileSync(LOG_FILE, 'utf8'));
+    } else {
+        res.send('No logs yet.');
+    }
+});
 
 // Rate limit: max 5 requests per IP per 10 min
 const pairingLimiter = rateLimit({
@@ -173,123 +200,139 @@ app.get('/api/pair', pairingLimiter, async (req, res) => {
 
     sendSSE('status', { message: 'Initializing WhatsApp connection...', icon: '🔌' });
 
-    try {
-        // Use pre-cached version for FLASH-FAST startup (no GitHub API call per user)
-        const version = cachedWAVersion || (await fetchLatestBaileysVersion()).version;
-        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    const connect = async () => {
+        if (isClosed) return;
 
-        sock = makeWASocket({
-            version,
-            auth:                 state,
-            logger:               pino({ level: 'silent' }),
-            printQRInTerminal:    false,
-            // WhatsApp Web browser fingerprint — most stable for pairing
-            browser:              ['WhatsApp Web', 'Chrome', '4.0.0'],
-            connectTimeoutMs:     60_000,
-            defaultQueryTimeoutMs:30_000,
-            keepAliveIntervalMs:  25_000,
-            retryRequestDelayMs:  250,
-            // Memory savings: skip unnecessary caches
-            generateHighQualityLinkPreview: false,
-            syncFullHistory: false,
-        });
+        try {
+            const version = cachedWAVersion || (await fetchLatestBaileysVersion()).version;
+            const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
 
-        sock.ev.on('creds.update', saveCreds);
+            sock = makeWASocket({
+                version,
+                auth:                 state,
+                logger:               pino({ level: 'silent' }),
+                printQRInTerminal:    false,
+                // Standard desktop Chrome signature — most stable for pairing
+                browser:              ['Ubuntu', 'Chrome', '20.0.04'],
+                connectTimeoutMs:     60_000,
+                defaultQueryTimeoutMs:30_000,
+                keepAliveIntervalMs:  25_000,
+                retryRequestDelayMs:  250,
+                generateHighQualityLinkPreview: false,
+                syncFullHistory: false,
+                options: {
+                    family: 4 // Force IPv4 to bypass cloud IPv6 issues on Railway
+                }
+            });
 
-        sock.ev.on('connection.update', async (update) => {
-            if (isClosed) return;
-            const { connection, lastDisconnect, qr } = update;
+            sock.ev.on('creds.update', saveCreds);
 
-            // ── QR received = WA socket is fully connected & ready ──────────
-            if (qr) {
-                if (method === 'qr') {
-                    // QR mode: render the QR code
-                    sendSSE('qr', { qr });
-                    sendSSE('status', { message: 'QR Code ready — scan now!', icon: '📱' });
-                } else if (method === 'code' && !pairingCodeRequested) {
-                    // Code mode: QR event fires = socket is ready → request pairing code NOW
-                    // This is the correct timing (not an arbitrary setTimeout)
-                    pairingCodeRequested = true;
-                    sendSSE('status', { message: 'WhatsApp connected — requesting pairing code...', icon: '🔢' });
-                    try {
-                        const code      = await sock.requestPairingCode(number);
-                        const formatted = code.match(/.{1,4}/g)?.join('-') || code;
-                        sendSSE('code', { code: formatted });
-                        sendSSE('status', { message: 'Enter this code in WhatsApp › Linked Devices', icon: '📲' });
-                    } catch (err) {
-                        if (!isClosed) {
-                            sendSSE('error', { message: 'Could not get pairing code: ' + err.message });
-                            cleanup('pairing code error');
-                            if (!res.writableEnded) res.end();
+            sock.ev.on('connection.update', async (update) => {
+                if (isClosed) return;
+                const { connection, lastDisconnect, qr } = update;
+
+                // ── QR received = WA socket is fully connected & ready ──────────
+                if (qr) {
+                    if (method === 'qr') {
+                        // QR mode: render the QR code
+                        sendSSE('qr', { qr });
+                        sendSSE('status', { message: 'QR Code ready — scan now!', icon: '📱' });
+                    } else if (method === 'code' && !pairingCodeRequested) {
+                        // Code mode: QR event fires = socket is ready → request pairing code NOW
+                        pairingCodeRequested = true;
+                        sendSSE('status', { message: 'WhatsApp connected — requesting pairing code...', icon: '🔢' });
+                        try {
+                            const code      = await sock.requestPairingCode(number);
+                            const formatted = code.match(/.{1,4}/g)?.join('-') || code;
+                            sendSSE('code', { code: formatted });
+                            sendSSE('status', { message: 'Enter this code in WhatsApp › Linked Devices', icon: '📲' });
+                        } catch (err) {
+                            if (!isClosed) {
+                                sendSSE('error', { message: 'Could not get pairing code: ' + err.message });
+                                cleanup('pairing code error');
+                                if (!res.writableEnded) res.end();
+                            }
                         }
                     }
                 }
-            }
 
-            if (connection === 'open') {
-                sendSSE('status', { message: 'Connected! Generating your Session ID...', icon: '⚡' });
-                try {
-                    const credsPath = path.join(sessionDir, 'creds.json');
-                    let attempts = 0;
-                    while (!fs.existsSync(credsPath) && attempts++ < 10) {
-                        await new Promise(r => setTimeout(r, 500));
-                    }
-                    if (!fs.existsSync(credsPath)) throw new Error('creds.json not written in time');
-
-                    const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
-                    const generatedId = 'STARK-MD~' + Buffer.from(JSON.stringify(creds)).toString('base64');
-
-                    // Send to user's own WhatsApp
+                if (connection === 'open') {
+                    sendSSE('status', { message: 'Connected! Generating your Session ID...', icon: '⚡' });
                     try {
-                        const userJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
-                        await sock.sendMessage(userJid, {
-                            text: `╔══════════════════════╗\n║ ᝰ.ᐟsᴏʜᴀɪʙ-x-ᴍᴅ ꨄ </👑 ║\n╚══════════════════════╝\n\n✅ *SESSION ID GENERATED*\n\nPaste this as your SESSION_ID:\n\n${generatedId}\n\n⚠️ Keep this PRIVATE!`
-                        });
-                        sendSSE('status', { message: 'Session ID sent to your WhatsApp!', icon: '📨' });
-                    } catch (sendErr) {
-                        console.warn(`[${sessionId}] WA send failed (non-fatal):`, sendErr.message);
+                        const credsPath = path.join(sessionDir, 'creds.json');
+                        let attempts = 0;
+                        while (!fs.existsSync(credsPath) && attempts++ < 10) {
+                            await new Promise(r => setTimeout(r, 500));
+                        }
+                        if (!fs.existsSync(credsPath)) throw new Error('creds.json not written in time');
+
+                        const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+                        const generatedId = 'STARK-MD~' + Buffer.from(JSON.stringify(creds)).toString('base64');
+
+                        // Send to user's own WhatsApp
+                        try {
+                            const userJid = sock.user.id.split(':')[0] + '@s.whatsapp.net';
+                            await sock.sendMessage(userJid, {
+                                text: `╔══════════════════════╗\n║ ᝰ.ᐟsᴏʜᴀɪʙ-x-ᴍᴅ ꨄ </👑 ║\n╚══════════════════════╝\n\n✅ *SESSION ID GENERATED*\n\nPaste this as your SESSION_ID:\n\n${generatedId}\n\n⚠️ Keep this PRIVATE!`
+                            });
+                            sendSSE('status', { message: 'Session ID sent to your WhatsApp!', icon: '📨' });
+                        } catch (sendErr) {
+                            console.warn(`[${sessionId}] WA send failed (non-fatal):`, sendErr.message);
+                        }
+
+                        sendSSE('connected', { sessionId: generatedId, message: 'Session generated!' });
+                    } catch (e) {
+                        sendSSE('error', { message: 'Failed to generate session: ' + e.message });
+                    }
+                    cleanup('pairing complete');
+                    if (!res.writableEnded) res.end();
+                }
+
+                if (connection === 'close' && !isClosed) {
+                    const code   = lastDisconnect?.error?.output?.statusCode;
+                    const reason = DisconnectReason[code] || code || 'Unknown';
+
+                    // Reconnect on transient codes (including restartRequired 515, connectionLost 408, serviceUnavailable 503)
+                    const shouldReconnect = code !== DisconnectReason.loggedOut && code !== 401 && code !== 403;
+                    if (shouldReconnect) {
+                        console.log(`[${sessionId}] Connection closed with retryable code=${code} (${reason}). Reconnecting...`);
+                        sendSSE('status', { message: 'Reconnecting to WhatsApp...', icon: '🔄' });
+                        
+                        pairingCodeRequested = false;
+                        
+                        try { sock?.ws?.close(); } catch (e) {}
+                        try { sock?.end(undefined); } catch (e) {}
+                        
+                        await new Promise(r => setTimeout(r, 2000));
+                        connect();
+                        return;
                     }
 
-                    sendSSE('connected', { sessionId: generatedId, message: 'Session generated!' });
-                } catch (e) {
-                    sendSSE('error', { message: 'Failed to generate session: ' + e.message });
+                    const msg = code === 401 || code === 403
+                        ? '⚠️ WhatsApp rejected this session. Open WhatsApp Settings → Linked Devices and remove any old sessions, then try again.'
+                        : `Connection closed (${reason}). Please try again.`;
+                    sendSSE('error', { message: msg });
+                    cleanup(`WA close code=${code}`);
+                    if (!res.writableEnded) res.end();
                 }
-                cleanup('pairing complete');
-                if (!res.writableEnded) res.end();
+            });
+
+            // For pairing code method: status message while waiting for QR event
+            if (method === 'code') {
+                sendSSE('status', { message: 'Connecting to WhatsApp servers...', icon: '🔌' });
             }
 
-            if (connection === 'close' && !isClosed) {
-                const code   = lastDisconnect?.error?.output?.statusCode;
-                const reason = DisconnectReason[code] || code || 'Unknown';
-
-                // ── restartRequired (515): WA says reconnect — just retry silently ──
-                if (code === 515) {
-                    console.log(`[${sessionId}] restartRequired — reconnecting...`);
-                    sendSSE('status', { message: 'Reconnecting to WhatsApp...', icon: '🔄' });
-                    // Don't cleanup — the socket will reconnect automatically
-                    return;
-                }
-
-                const msg = code === 401 || code === 403
-                    ? '⚠️ WhatsApp rejected this session. Open WhatsApp Settings → Linked Devices and remove any old sessions, then try again.'
-                    : `Connection closed (${reason}). Please try again.`;
-                sendSSE('error', { message: msg });
-                cleanup(`WA close code=${code}`);
-                if (!res.writableEnded) res.end();
+        } catch (e) {
+            console.error(`[${sessionId}] Connect error:`, e.message);
+            if (!isClosed) {
+                sendSSE('status', { message: 'Connection issue. Retrying...', icon: '🔄' });
+                await new Promise(r => setTimeout(r, 3000));
+                connect();
             }
-        });
-
-        // For pairing code method: status message while waiting for QR event
-        if (method === 'code') {
-            sendSSE('status', { message: 'Connecting to WhatsApp servers...', icon: '🔌' });
         }
+    };
 
-    } catch (e) {
-        console.error(`[${sessionId}] Fatal error:`, e.message);
-        if (!isClosed) sendSSE('error', { message: 'Server error: ' + e.message });
-        cleanup('fatal error');
-        if (!res.writableEnded) res.end();
-    }
+    connect();
 });
 
 // ── 404 → index ────────────────────────────────────────────────────────────────
