@@ -183,7 +183,8 @@ app.get('/api/pair', pairingLimiter, async (req, res) => {
             auth:                 state,
             logger:               pino({ level: 'silent' }),
             printQRInTerminal:    false,
-            browser:              ['Ubuntu', 'Chrome', '20.0.04'],
+            // WhatsApp Web browser fingerprint — most stable for pairing
+            browser:              ['WhatsApp Web', 'Chrome', '4.0.0'],
             connectTimeoutMs:     60_000,
             defaultQueryTimeoutMs:30_000,
             keepAliveIntervalMs:  25_000,
@@ -199,9 +200,30 @@ app.get('/api/pair', pairingLimiter, async (req, res) => {
             if (isClosed) return;
             const { connection, lastDisconnect, qr } = update;
 
-            if (qr && method === 'qr') {
-                sendSSE('qr', { qr });
-                sendSSE('status', { message: 'QR Code ready — scan now!', icon: '📱' });
+            // ── QR received = WA socket is fully connected & ready ──────────
+            if (qr) {
+                if (method === 'qr') {
+                    // QR mode: render the QR code
+                    sendSSE('qr', { qr });
+                    sendSSE('status', { message: 'QR Code ready — scan now!', icon: '📱' });
+                } else if (method === 'code' && !pairingCodeRequested) {
+                    // Code mode: QR event fires = socket is ready → request pairing code NOW
+                    // This is the correct timing (not an arbitrary setTimeout)
+                    pairingCodeRequested = true;
+                    sendSSE('status', { message: 'WhatsApp connected — requesting pairing code...', icon: '🔢' });
+                    try {
+                        const code      = await sock.requestPairingCode(number);
+                        const formatted = code.match(/.{1,4}/g)?.join('-') || code;
+                        sendSSE('code', { code: formatted });
+                        sendSSE('status', { message: 'Enter this code in WhatsApp › Linked Devices', icon: '📲' });
+                    } catch (err) {
+                        if (!isClosed) {
+                            sendSSE('error', { message: 'Could not get pairing code: ' + err.message });
+                            cleanup('pairing code error');
+                            if (!res.writableEnded) res.end();
+                        }
+                    }
+                }
             }
 
             if (connection === 'open') {
@@ -239,34 +261,27 @@ app.get('/api/pair', pairingLimiter, async (req, res) => {
             if (connection === 'close' && !isClosed) {
                 const code   = lastDisconnect?.error?.output?.statusCode;
                 const reason = DisconnectReason[code] || code || 'Unknown';
-                const msg    = code === 401 || code === 403
-                    ? 'Rejected by WhatsApp. Please try again.'
-                    : `Disconnected (${reason}). Please try again.`;
+
+                // ── restartRequired (515): WA says reconnect — just retry silently ──
+                if (code === 515) {
+                    console.log(`[${sessionId}] restartRequired — reconnecting...`);
+                    sendSSE('status', { message: 'Reconnecting to WhatsApp...', icon: '🔄' });
+                    // Don't cleanup — the socket will reconnect automatically
+                    return;
+                }
+
+                const msg = code === 401 || code === 403
+                    ? '⚠️ WhatsApp rejected this session. Open WhatsApp Settings → Linked Devices and remove any old sessions, then try again.'
+                    : `Connection closed (${reason}). Please try again.`;
                 sendSSE('error', { message: msg });
                 cleanup(`WA close code=${code}`);
                 if (!res.writableEnded) res.end();
             }
         });
 
-        // Pairing code: request after 3 s delay
+        // For pairing code method: status message while waiting for QR event
         if (method === 'code') {
-            sendSSE('status', { message: 'Requesting pairing code...', icon: '🔢' });
-            await new Promise(r => setTimeout(r, 3000));
-            if (!isClosed && !pairingCodeRequested) {
-                pairingCodeRequested = true;
-                try {
-                    const code      = await sock.requestPairingCode(number);
-                    const formatted = code.match(/.{1,4}/g)?.join('-') || code;
-                    sendSSE('code', { code: formatted });
-                    sendSSE('status', { message: 'Enter this code in WhatsApp › Linked Devices', icon: '📲' });
-                } catch (err) {
-                    if (!isClosed) {
-                        sendSSE('error', { message: 'Pairing code failed: ' + err.message + '. Try QR instead.' });
-                        cleanup('pairing code error');
-                        if (!res.writableEnded) res.end();
-                    }
-                }
-            }
+            sendSSE('status', { message: 'Connecting to WhatsApp servers...', icon: '🔌' });
         }
 
     } catch (e) {
