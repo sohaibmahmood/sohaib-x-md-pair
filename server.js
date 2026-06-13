@@ -42,13 +42,16 @@ const ACTIVE_BOTS = new Map(); // tracks single bot instance: 'bot' -> ChildProc
 
 function readSession() {
     try {
+        if (process.env.SESSION_ID) {
+            return process.env.SESSION_ID;
+        }
         if (!fs.existsSync(SESSIONS_FILE)) {
             fs.writeFileSync(SESSIONS_FILE, JSON.stringify({ sessionId: '' }));
         }
         const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
         return data.sessionId || '';
     } catch (e) {
-        return '';
+        return process.env.SESSION_ID || '';
     }
 }
 
