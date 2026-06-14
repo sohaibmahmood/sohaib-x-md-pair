@@ -141,7 +141,7 @@ function patchRepoFiles(extractedRepoPath) {
             
             // 3a. Inject plugin exclusions
             const originalPluginLoader = 'fs.readdirSync("./plugins/").forEach((plugin) => {';
-            const patchedPluginLoader = 'const EXCLUDED_PLUGINS = ["logo.js", "drama.js", "reactions.js", "pinterest.js", "spider-fun.js"];\n              fs.readdirSync("./plugins/").forEach((plugin) => {\n                if (EXCLUDED_PLUGINS.includes(plugin)) return;';
+            const patchedPluginLoader = 'const EXCLUDED_PLUGINS = ["logo.js", "drama.js", "reactions.js", "pinterest.js", "spider-fun.js", "fun.js", "ai.js"];\n              fs.readdirSync("./plugins/").forEach((plugin) => {\n                if (EXCLUDED_PLUGINS.includes(plugin)) return;';
             content = content.replace(originalPluginLoader, patchedPluginLoader);
             
             // 3b. Inject Server-Sent Events Pairing API route
