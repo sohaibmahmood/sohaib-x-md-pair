@@ -1,4 +1,4 @@
-const { cmd } = require('../lib');
+const { cmd, downloadMediaMessage } = require('../lib');
 const fs = require('fs');
 const path = require('path');
 
@@ -105,9 +105,10 @@ cmd({
 
     for (const target of targets) {
       try {
-        const buffer = await conn.downloadMediaMessage({
+        // Use the working downloadMediaMessage helper from the core library
+        const buffer = await downloadMediaMessage({
           msg: target.msg,
-          mtype: "documentMessage"
+          type: "documentMessage"
         });
 
         if (!buffer) throw new Error("Could not download buffer");
