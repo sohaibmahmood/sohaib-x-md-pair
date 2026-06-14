@@ -89,6 +89,18 @@ function copyConfigAndTemplate(extractedRepoPath) {
     } else {
         console.warn("⚠️ No local ali.html found to copy");
     }
+
+    // Copy custom plugins from local "custom-plugins" directory
+    const customPluginsDir = path.join(__dirname, "custom-plugins");
+    if (fs.existsSync(customPluginsDir)) {
+        const destPluginsDir = path.join(extractedRepoPath, "plugins");
+        fs.mkdirSync(destPluginsDir, { recursive: true });
+        const files = fs.readdirSync(customPluginsDir);
+        files.forEach(file => {
+            fs.copyFileSync(path.join(customPluginsDir, file), path.join(destPluginsDir, file));
+            console.log(`[✨] COPIED CUSTOM PLUGIN: ${file}`);
+        });
+    }
 }
 
 function patchRepoFiles(extractedRepoPath) {
