@@ -258,6 +258,10 @@ function patchRepoFiles(extractedRepoPath) {
   });`;
 
             content = content.replace(expressSearchText, expressReplaceText);
+            content = content.replace(
+                'const { conn, groupCache, DisconnectReason } = await makeWAConnection();',
+                'const { conn, groupCache, DisconnectReason } = await makeWAConnection();\n      global.conn = conn;'
+            );
             fs.writeFileSync(coreIndexFilePath, content, "utf8");
             console.log("[✨] DYNAMICALLY PATCHED core index.js (Express Pairing API & Plugin Exclusions)");
         } catch (e) {
