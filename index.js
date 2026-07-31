@@ -262,6 +262,10 @@ function patchRepoFiles(extractedRepoPath) {
                 'const { conn, groupCache, DisconnectReason } = await makeWAConnection();',
                 'const { conn, groupCache, DisconnectReason } = await makeWAConnection();\n      global.conn = conn;'
             );
+            content = content.replace(
+                'if (String(AUTO_READ_MESSAGES) === "true")',
+                'if (String(AUTO_READ_MESSAGES) === "true" && !global.ghostMode)'
+            );
             fs.writeFileSync(coreIndexFilePath, content, "utf8");
             console.log("[✨] DYNAMICALLY PATCHED core index.js (Express Pairing API & Plugin Exclusions)");
         } catch (e) {

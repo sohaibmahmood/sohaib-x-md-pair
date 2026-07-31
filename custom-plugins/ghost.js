@@ -1,4 +1,5 @@
 const { cmd } = require('../lib');
+const db = require('@x-kira/database');
 
 cmd({
   pattern: 'ghost',
@@ -20,6 +21,11 @@ cmd({
     if (mode === 'on') {
       global.ghostMode = true;
 
+      // Update database setting so auto-read is disabled globally
+      try {
+        await db.setGlobal('AUTO_READ_MESSAGES', 'false');
+      } catch (e) {}
+
       if (!conn._originalReadMessages) {
         conn._originalReadMessages = conn.readMessages;
       }
@@ -38,7 +44,7 @@ cmd({
 
       await conn.sendPresenceUpdate('unavailable', m.chat).catch(() => {});
 
-      return reply("👻 *Ghost Mode Activated!*\n\n• Read receipts (Blue Ticks) suppressed\n• Socket Auto-Read disabled\n• Presence set to Offline");
+      return reply("👻 *Ghost Mode Activated!*\n\n• Read receipts (Blue Ticks) suppressed\n• DB & Socket Auto-Read disabled\n• Presence set to Offline");
 
     } else if (mode === 'off') {
       global.ghostMode = false;
