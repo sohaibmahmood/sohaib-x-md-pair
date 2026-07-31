@@ -4,7 +4,7 @@ cmd({
   pattern: 'ghost',
   alias: ['invisible', 'ghostmode'],
   react: '👻',
-  desc: 'Toggle Ghost mode (Stay invisible and suppress read receipts)',
+  desc: 'Toggle Ghost mode (Suppress read receipts, auto-read & presence)',
   category: 'tools',
   filename: __filename
 }, async (conn, mek, m, { reply, args, isOwner }) => {
@@ -13,35 +13,50 @@ cmd({
 
     const mode = args[0]?.toLowerCase();
 
+    if (typeof global.ghostMode === 'undefined') {
+      global.ghostMode = false;
+    }
+
     if (mode === 'on') {
       global.ghostMode = true;
 
-      // Store original readMessages function if not already saved
       if (!conn._originalReadMessages) {
         conn._originalReadMessages = conn.readMessages;
       }
+      if (!conn._originalSendReceipt && conn.sendReceipt) {
+        conn._originalSendReceipt = conn.sendReceipt;
+      }
 
-      // Override readMessages to suppress sending read receipts over network
-      conn.readMessages = async () => {
-        // Suppress network read receipt stanza
-        return Promise.resolve();
-      };
+      if (conn.opts) {
+        conn.opts.autoRead = false;
+      }
+
+      conn.readMessages = async () => Promise.resolve();
+      if (conn.sendReceipt) {
+        conn.sendReceipt = async () => Promise.resolve();
+      }
 
       await conn.sendPresenceUpdate('unavailable', m.chat).catch(() => {});
 
-      return reply("👻 *Ghost Mode Activated!*\n\n• Read receipts (blue ticks) suppressed\n• Presence updates set to offline");
+      return reply("👻 *Ghost Mode Activated!*\n\n• Read receipts (Blue Ticks) suppressed\n• Socket Auto-Read disabled\n• Presence set to Offline");
 
     } else if (mode === 'off') {
       global.ghostMode = false;
 
-      // Restore original readMessages function
+      if (conn.opts) {
+        conn.opts.autoRead = true;
+      }
+
       if (conn._originalReadMessages) {
         conn.readMessages = conn._originalReadMessages;
+      }
+      if (conn._originalSendReceipt && conn.sendReceipt) {
+        conn.sendReceipt = conn._originalSendReceipt;
       }
 
       await conn.sendPresenceUpdate('available', m.chat).catch(() => {});
 
-      return reply("✅ *Ghost Mode Deactivated!*\n\n• Normal read receipt and presence behavior restored.");
+      return reply("✅ *Ghost Mode Deactivated!*\n\n• Normal read receipt, auto-read, and presence behavior restored.");
 
     } else {
       return reply("❌ *Usage:* `.ghost on` or `.ghost off`");
